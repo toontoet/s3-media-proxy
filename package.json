@@ -1,0 +1,27 @@
+{
+  "name": "s3-media-proxy",
+  "version": "1.0.0",
+  "description": "S3 Media Proxy for serving images and videos from S3-compatible storage",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "keywords": [
+    "s3",
+    "proxy",
+    "media",
+    "streaming"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.21.2",
+    "@aws-sdk/client-s3": "^3.0.0"
+  }
+}
+
