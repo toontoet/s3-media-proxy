@@ -1,5 +1,8 @@
 import express from 'express';
 import { S3Client } from '@aws-sdk/client-s3';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
+import http from 'http';
+import https from 'https';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -38,6 +41,32 @@ async function initializeProxies() {
           console.log(`   - Folder prefix: ${config.folder || 'none'}`);
         }
         
+        // Configure HTTP agents with higher socket limits for high concurrency
+        // This prevents "socket usage at capacity" warnings under load
+        const httpAgent = new http.Agent({
+          keepAlive: true,
+          keepAliveMsecs: 1000,
+          maxSockets: 200,
+          maxFreeSockets: 50,
+        });
+        
+        const httpsAgent = new https.Agent({
+          keepAlive: true,
+          keepAliveMsecs: 1000,
+          maxSockets: 200,
+          maxFreeSockets: 50,
+        });
+        
+        // Configure HTTP handler with custom agents
+        const httpHandler = new NodeHttpHandler({
+          requestTimeout: 30000,
+          connectionTimeout: 30000,
+          socketAcquisitionWarningTimeout: 10000,
+          maxAttempts: 3,
+          httpAgent,
+          httpsAgent,
+        });
+        
         const s3Client = new S3Client({
           region: config.region,
           endpoint: config.endpoint ? `https://${config.endpoint}` : undefined,
@@ -46,6 +75,7 @@ async function initializeProxies() {
             secretAccessKey: config.accessSecret,
           },
           forcePathStyle: true, // Required for S3-compatible services
+          requestHandler: httpHandler,
         });
         
         proxyInstances[name] = { s3: s3Client, config };
