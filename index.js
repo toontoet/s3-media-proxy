@@ -1,10 +1,17 @@
 import express from 'express';
-import { S3Client } from '@aws-sdk/client-s3';
+import {
+  GetObjectCommand,
+  HeadBucketCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  S3Client,
+} from '@aws-sdk/client-s3';
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import http from 'http';
 import https from 'https';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
+import { pipeline } from 'stream/promises';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -13,6 +20,25 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DEBUG = process.env.DEBUG === 'true';
+const READINESS_TIMEOUT_MS = parsePositiveInteger(process.env.READINESS_TIMEOUT_MS, 5000);
+
+function parsePositiveInteger(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function buildS3Key(config, filePath) {
+  return config.folder ? `${config.folder}/${filePath}` : filePath;
+}
+
+function isClientAbortError(error) {
+  return (
+    error?.name === 'AbortError' ||
+    error?.name === 'RequestAbortedError' ||
+    error?.code === 'ABORT_ERR' ||
+    error?.code === 'ERR_STREAM_PREMATURE_CLOSE'
+  );
+}
 
 // Load storage configuration
 let storageConfig;
@@ -101,6 +127,64 @@ app.get('/health', (req, res) => {
   });
 });
 
+async function checkBackendReadiness(name, proxy) {
+  const startedAt = Date.now();
+  const { s3: s3Client, config } = proxy;
+  const checkType = config.healthCheckKey ? 'object' : 'bucket';
+
+  try {
+    const command = config.healthCheckKey
+      ? new HeadObjectCommand({
+          Bucket: config.bucket,
+          Key: buildS3Key(config, config.healthCheckKey),
+        })
+      : new HeadBucketCommand({
+          Bucket: config.bucket,
+        });
+
+    await s3Client.send(command, {
+      abortSignal: AbortSignal.timeout(READINESS_TIMEOUT_MS),
+    });
+
+    return {
+      name,
+      status: 'ok',
+      bucket: config.bucket,
+      check: checkType,
+      durationMs: Date.now() - startedAt,
+    };
+  } catch (error) {
+    const result = {
+      name,
+      status: 'error',
+      bucket: config.bucket,
+      check: checkType,
+      durationMs: Date.now() - startedAt,
+      error: error.message,
+      errorType: error.name,
+      httpStatus: error.$metadata?.httpStatusCode,
+    };
+
+    console.error(`✗ Readiness failed for ${name}: ${error.message}`);
+    return result;
+  }
+}
+
+// Readiness check endpoint: validates that configured storage backends are reachable.
+app.get('/ready', async (req, res) => {
+  const checks = await Promise.all(
+    Object.entries(proxyInstances).map(([name, proxy]) => checkBackendReadiness(name, proxy))
+  );
+  const isReady = checks.every((check) => check.status === 'ok');
+
+  res.status(isReady ? 200 : 503).json({
+    status: isReady ? 'ok' : 'degraded',
+    backends: checks,
+    timeoutMs: READINESS_TIMEOUT_MS,
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // Debug endpoints (only enabled with DEBUG=true)
 if (DEBUG) {
   
@@ -116,8 +200,6 @@ app.get('/debug/list/:configName/*?', async (req, res) => {
   const fullPrefix = config.folder ? `${config.folder}/${prefix}` : prefix;
   
   try {
-    const { ListObjectsV2Command } = await import('@aws-sdk/client-s3');
-    
     const command = new ListObjectsV2Command({
       Bucket: config.bucket,
       Prefix: fullPrefix,
@@ -157,8 +239,6 @@ app.get('/debug/check/:configName/*', async (req, res) => {
   const s3Key = config.folder ? `${config.folder}/${filePath}` : filePath;
   
   try {
-    const { HeadObjectCommand } = await import('@aws-sdk/client-s3');
-    
     const command = new HeadObjectCommand({
       Bucket: config.bucket,
       Key: s3Key,
@@ -247,15 +327,42 @@ app.get('/api/storage/:configName/*', async (req, res, next) => {
   const { s3: s3Client, config } = proxyInstances[configName];
 
   // Construct full S3 key with folder prefix
-  const s3Key = config.folder ? `${config.folder}/${filePath}` : filePath;
+  const s3Key = buildS3Key(config, filePath);
 
   if (DEBUG) {
     console.log(`🔍 ${configName}/${filePath} (range: ${req.headers.range || 'full'})`);
   }
 
+  let response;
+  let clientAborted = false;
+  const abortController = new AbortController();
+  const abortUpstream = (reason) => {
+    if (clientAborted) {
+      return;
+    }
+
+    clientAborted = true;
+    console.warn(`⚠ Client aborted ${configName}/${filePath}: ${reason}`);
+
+    if (!abortController.signal.aborted) {
+      abortController.abort();
+    }
+
+    if (response?.Body && typeof response.Body.destroy === 'function') {
+      response.Body.destroy(new Error(reason));
+    }
+  };
+  const onRequestAborted = () => abortUpstream('request aborted');
+  const onResponseClosed = () => {
+    if (!res.writableEnded) {
+      abortUpstream('response closed before stream completed');
+    }
+  };
+
+  req.on('aborted', onRequestAborted);
+  res.on('close', onResponseClosed);
+
   try {
-    const { GetObjectCommand } = await import('@aws-sdk/client-s3');
-    
     // Get object from S3 (with range support)
     const command = new GetObjectCommand({
       Bucket: config.bucket,
@@ -263,7 +370,9 @@ app.get('/api/storage/:configName/*', async (req, res, next) => {
       Range: req.headers.range,
     });
     
-    const response = await s3Client.send(command);
+    response = await s3Client.send(command, {
+      abortSignal: abortController.signal,
+    });
     
     // Set response headers
     if (req.headers.range) {
@@ -297,9 +406,16 @@ app.get('/api/storage/:configName/*', async (req, res, next) => {
       });
     }
     
-    response.Body.pipe(res);
+    await pipeline(response.Body, res);
     
   } catch (error) {
+    if (clientAborted || isClientAbortError(error)) {
+      if (DEBUG) {
+        console.warn(`⚠ Stream aborted for ${configName}/${filePath}: ${error.message}`);
+      }
+      return;
+    }
+
     console.error(`✗ ${configName}/${filePath}: ${error.message}`);
     
     if (DEBUG) {
@@ -322,6 +438,9 @@ app.get('/api/storage/:configName/*', async (req, res, next) => {
         message: error.message
       });
     }
+  } finally {
+    req.off('aborted', onRequestAborted);
+    res.off('close', onResponseClosed);
   }
 });
 
@@ -349,11 +468,32 @@ app.use((error, req, res, next) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`✓ S3 Media Proxy listening on port ${PORT}`);
   console.log(`✓ Backends: ${Object.keys(proxyInstances).join(', ')}`);
   if (DEBUG) {
     console.log(`✓ Debug mode enabled - /debug/check and /debug/list available`);
   }
 });
+
+function shutdown(signal) {
+  console.log(`✓ Received ${signal}, shutting down gracefully`);
+
+  server.close(() => {
+    for (const { s3: s3Client } of Object.values(proxyInstances)) {
+      s3Client.destroy();
+    }
+
+    console.log('✓ Shutdown complete');
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error('✗ Graceful shutdown timed out');
+    process.exit(1);
+  }, 10000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 

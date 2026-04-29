@@ -6,7 +6,8 @@
     "region": "eu-central",
     "endpoint": "fsn1.your-objectstorage.com",
     "bucket": "your-bucket-name",
-    "folder": "media"
+    "folder": "media",
+    "healthCheckKey": "healthcheck.txt"
   },
   "VODSERVER": {
     "type": "s3",
@@ -15,7 +16,8 @@
     "region": "eu-central",
     "endpoint": "fsn1.your-objectstorage.com",
     "bucket": "your-vod-bucket",
-    "folder": "ondemand"
+    "folder": "ondemand",
+    "healthCheckKey": "healthcheck.txt"
   }
 }
 

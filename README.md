@@ -30,7 +30,8 @@ Create a `storage.json` file with your S3 backend configurations:
     "region": "eu-central",
     "endpoint": "fsn1.your-objectstorage.com",
     "bucket": "your-bucket-name",
-    "folder": "media"
+    "folder": "media",
+    "healthCheckKey": "healthcheck.txt"
   },
   "VODSERVER": {
     "type": "s3",
@@ -39,7 +40,8 @@ Create a `storage.json` file with your S3 backend configurations:
     "region": "eu-central",
     "endpoint": "fsn1.your-objectstorage.com",
     "bucket": "your-vod-bucket",
-    "folder": "ondemand"
+    "folder": "ondemand",
+    "healthCheckKey": "healthcheck.txt"
   }
 }
 ```
@@ -53,6 +55,7 @@ Create a `storage.json` file with your S3 backend configurations:
 - `endpoint`: S3-compatible endpoint (without https://)
 - `bucket`: Bucket name
 - `folder`: Folder prefix within the bucket (optional)
+- `healthCheckKey`: Object key used by `/ready` to verify object access (optional, relative to `folder`)
 
 ## Installation and Usage
 
@@ -106,6 +109,13 @@ services:
     restart: unless-stopped
     environment:
       - NODE_ENV=production
+      - READINESS_TIMEOUT_MS=5000
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 ```
 
 Start with:
@@ -122,7 +132,7 @@ docker-compose up -d
 GET /health
 ```
 
-Returns the server status and available backends.
+Returns the server liveness status and available backends. This only confirms that the Node.js process can answer requests.
 
 **Response:**
 ```json
@@ -132,6 +142,16 @@ Returns the server status and available backends.
   "timestamp": "2025-10-29T12:00:00.000Z"
 }
 ```
+
+### Readiness Check
+
+```
+GET /ready
+```
+
+Checks whether each configured storage backend is reachable. If `healthCheckKey` is configured, the proxy verifies that object with `HeadObject`; otherwise it falls back to `HeadBucket`.
+
+The endpoint returns `200` when all backends are ready and `503` when one or more backends fail. Docker Compose uses this endpoint for container health so storage or credential failures are detected instead of only checking that Express is alive.
 
 ### Media Proxy
 
@@ -201,6 +221,7 @@ Set `DEBUG=true` for verbose logging including:
 - `STORAGE_CONFIG_PATH`: Path to storage.json (default: ./storage.json)
 - `NODE_ENV`: Node environment (production/development)
 - `DEBUG`: Verbose debug logging and debug endpoints (default: false)
+- `READINESS_TIMEOUT_MS`: Per-backend readiness timeout in milliseconds (default: 5000)
 
 ### Debug Mode
 
@@ -245,6 +266,14 @@ Verify:
 - Access key and secret are correct
 - Bucket name is correct
 - Firewall/network settings
+
+### "/ready" returns 503
+
+The process is alive, but at least one storage backend cannot be verified. Check the response body and logs for the backend name, HTTP status, and error message.
+
+If credentials only allow object reads and not bucket-level checks, add a small object such as `healthcheck.txt` to the configured folder and set `healthCheckKey` for that backend.
+
+Configuration and credentials are loaded once at startup. Restart the container after changing `storage.json` or rotating credentials.
 
 ## Security
 
