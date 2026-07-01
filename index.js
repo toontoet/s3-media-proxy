@@ -11,6 +11,7 @@ import http from 'http';
 import https from 'https';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
+import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { fileURLToPath } from 'url';
 
@@ -29,6 +30,33 @@ function parsePositiveInteger(value, fallback) {
 
 function buildS3Key(config, filePath) {
   return config.folder ? `${config.folder}/${filePath}` : filePath;
+}
+
+function getBackendType(config) {
+  if (config.type === 's3') {
+    return 's3';
+  }
+
+  if (config.url) {
+    return 'http';
+  }
+
+  return null;
+}
+
+function buildHttpUrl(config, filePath) {
+  const base = config.url.endsWith('/') ? config.url : `${config.url}/`;
+  const path = filePath.startsWith('/') ? filePath.slice(1) : filePath;
+  return new URL(path, base).href;
+}
+
+function buildHttpAuthHeader(config) {
+  if (!config.username) {
+    return undefined;
+  }
+
+  const credentials = Buffer.from(`${config.username}:${config.password ?? ''}`).toString('base64');
+  return `Basic ${credentials}`;
 }
 
 function isClientAbortError(error) {
@@ -57,7 +85,9 @@ const proxyInstances = {};
 
 async function initializeProxies() {
   for (const [name, config] of Object.entries(storageConfig)) {
-    if (config.type === 's3') {
+    const backendType = getBackendType(config);
+
+    if (backendType === 's3') {
       try {
         if (DEBUG) {
           console.log(`🔧 Initializing S3 client for: ${name}`);
@@ -66,7 +96,7 @@ async function initializeProxies() {
           console.log(`   - Endpoint: ${config.endpoint || 'default'}`);
           console.log(`   - Folder prefix: ${config.folder || 'none'}`);
         }
-        
+
         // Configure HTTP agents with higher socket limits for high concurrency
         // This prevents "socket usage at capacity" warnings under load
         const httpAgent = new http.Agent({
@@ -75,14 +105,14 @@ async function initializeProxies() {
           maxSockets: 200,
           maxFreeSockets: 50,
         });
-        
+
         const httpsAgent = new https.Agent({
           keepAlive: true,
           keepAliveMsecs: 1000,
           maxSockets: 200,
           maxFreeSockets: 50,
         });
-        
+
         // Configure HTTP handler with custom agents
         const httpHandler = new NodeHttpHandler({
           requestTimeout: 30000,
@@ -92,7 +122,7 @@ async function initializeProxies() {
           httpAgent,
           httpsAgent,
         });
-        
+
         const s3Client = new S3Client({
           region: config.region,
           endpoint: config.endpoint ? `https://${config.endpoint}` : undefined,
@@ -103,16 +133,38 @@ async function initializeProxies() {
           forcePathStyle: true, // Required for S3-compatible services
           requestHandler: httpHandler,
         });
-        
-        proxyInstances[name] = { s3: s3Client, config };
-        
-        console.log(`✓ Initialized backend: ${name} (${config.bucket}/${config.folder || ''})`);
+
+        proxyInstances[name] = { type: 's3', s3: s3Client, config };
+
+        console.log(`✓ Initialized backend: ${name} (s3://${config.bucket}/${config.folder || ''})`);
       } catch (error) {
         console.error(`✗ Failed to initialize S3 client for ${name}:`, error.message);
         console.error(error);
         process.exit(1);
       }
+      continue;
     }
+
+    if (backendType === 'http') {
+      try {
+        if (DEBUG) {
+          console.log(`🔧 Initializing HTTP backend for: ${name}`);
+          console.log(`   - URL: ${config.url}`);
+          console.log(`   - Auth: ${config.username ? 'basic' : 'none'}`);
+        }
+
+        proxyInstances[name] = { type: 'http', config };
+        console.log(`✓ Initialized backend: ${name} (${config.url})`);
+      } catch (error) {
+        console.error(`✗ Failed to initialize HTTP backend for ${name}:`, error.message);
+        console.error(error);
+        process.exit(1);
+      }
+      continue;
+    }
+
+    console.error(`✗ Unknown storage backend configuration for ${name}: expected type "s3" or a "url" field`);
+    process.exit(1);
   }
 }
 
@@ -129,6 +181,55 @@ app.get('/health', (req, res) => {
 
 async function checkBackendReadiness(name, proxy) {
   const startedAt = Date.now();
+
+  if (proxy.type === 'http') {
+    const { config } = proxy;
+    const checkUrl = config.healthCheckPath
+      ? buildHttpUrl(config, config.healthCheckPath)
+      : config.url;
+
+    try {
+      const headers = {};
+      const authorization = buildHttpAuthHeader(config);
+      if (authorization) {
+        headers.Authorization = authorization;
+      }
+
+      const response = await fetch(checkUrl, {
+        method: 'HEAD',
+        headers,
+        signal: AbortSignal.timeout(READINESS_TIMEOUT_MS),
+      });
+
+      if (!response.ok && response.status !== 405) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      return {
+        name,
+        status: 'ok',
+        type: 'http',
+        url: config.url,
+        check: config.healthCheckPath ? 'path' : 'url',
+        durationMs: Date.now() - startedAt,
+      };
+    } catch (error) {
+      const result = {
+        name,
+        status: 'error',
+        type: 'http',
+        url: config.url,
+        check: config.healthCheckPath ? 'path' : 'url',
+        durationMs: Date.now() - startedAt,
+        error: error.message,
+        errorType: error.name,
+      };
+
+      console.error(`✗ Readiness failed for ${name}: ${error.message}`);
+      return result;
+    }
+  }
+
   const { s3: s3Client, config } = proxy;
   const checkType = config.healthCheckKey ? 'object' : 'bucket';
 
@@ -149,6 +250,7 @@ async function checkBackendReadiness(name, proxy) {
     return {
       name,
       status: 'ok',
+      type: 's3',
       bucket: config.bucket,
       check: checkType,
       durationMs: Date.now() - startedAt,
@@ -157,6 +259,7 @@ async function checkBackendReadiness(name, proxy) {
     const result = {
       name,
       status: 'error',
+      type: 's3',
       bucket: config.bucket,
       check: checkType,
       durationMs: Date.now() - startedAt,
@@ -195,8 +298,13 @@ app.get('/debug/list/:configName/*?', async (req, res) => {
   if (!proxyInstances[configName]) {
     return res.status(404).json({ error: 'Backend not found' });
   }
+
+  const proxy = proxyInstances[configName];
+  if (proxy.type !== 's3') {
+    return res.status(400).json({ error: 'Debug listing is only supported for S3 backends' });
+  }
   
-  const { s3: s3Client, config } = proxyInstances[configName];
+  const { s3: s3Client, config } = proxy;
   const fullPrefix = config.folder ? `${config.folder}/${prefix}` : prefix;
   
   try {
@@ -234,8 +342,13 @@ app.get('/debug/check/:configName/*', async (req, res) => {
   if (!proxyInstances[configName]) {
     return res.status(404).json({ error: 'Backend not found' });
   }
+
+  const proxy = proxyInstances[configName];
+  if (proxy.type !== 's3') {
+    return res.status(400).json({ error: 'Debug checks are only supported for S3 backends' });
+  }
   
-  const { s3: s3Client, config } = proxyInstances[configName];
+  const { s3: s3Client, config } = proxy;
   const s3Key = config.folder ? `${config.folder}/${filePath}` : filePath;
   
   try {
@@ -301,6 +414,261 @@ app.use((req, res, next) => {
   next();
 });
 
+function createAbortHandlers(configName, filePath, abortController, getUpstreamBody) {
+  let clientAborted = false;
+
+  const abortUpstream = (reason) => {
+    if (clientAborted) {
+      return;
+    }
+
+    clientAborted = true;
+    console.warn(`⚠ Client aborted ${configName}/${filePath}: ${reason}`);
+
+    if (!abortController.signal.aborted) {
+      abortController.abort();
+    }
+
+    const upstreamBody = getUpstreamBody();
+    if (upstreamBody && typeof upstreamBody.destroy === 'function') {
+      upstreamBody.destroy(new Error(reason));
+    }
+  };
+
+  const bindResponseCloseHandler = (res) => () => {
+    if (!res.writableEnded) {
+      abortUpstream('response closed before stream completed');
+    }
+  };
+
+  return {
+    clientAborted: () => clientAborted,
+    onRequestAborted: () => abortUpstream('request aborted'),
+    bindResponseCloseHandler,
+  };
+}
+
+async function serveS3Object(proxy, configName, filePath, req, res) {
+  const { s3: s3Client, config } = proxy;
+  const s3Key = buildS3Key(config, filePath);
+
+  if (DEBUG) {
+    console.log(`🔍 ${configName}/${filePath} (s3, range: ${req.headers.range || 'full'})`);
+  }
+
+  let response;
+  const abortController = new AbortController();
+  const { clientAborted, onRequestAborted, bindResponseCloseHandler } = createAbortHandlers(
+    configName,
+    filePath,
+    abortController,
+    () => response?.Body
+  );
+  const onResponseClosed = bindResponseCloseHandler(res);
+
+  req.on('aborted', onRequestAborted);
+  res.on('close', onResponseClosed);
+
+  try {
+    const command = new GetObjectCommand({
+      Bucket: config.bucket,
+      Key: s3Key,
+      Range: req.headers.range,
+    });
+
+    response = await s3Client.send(command, {
+      abortSignal: abortController.signal,
+    });
+
+    if (req.headers.range) {
+      res.status(206);
+      res.setHeader('Content-Range', response.ContentRange);
+    } else {
+      res.status(200);
+    }
+
+    res.setHeader('Content-Type', response.ContentType || 'application/octet-stream');
+    res.setHeader('Content-Length', response.ContentLength);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=31536000');
+    res.setHeader('Last-Modified', response.LastModified?.toUTCString() || new Date().toUTCString());
+
+    if (response.ETag) {
+      res.setHeader('ETag', response.ETag);
+    }
+
+    if (DEBUG) {
+      let bytesStreamed = 0;
+      response.Body.on('data', (chunk) => {
+        bytesStreamed += chunk.length;
+      });
+      response.Body.on('end', () => {
+        console.log(`   ✓ Streamed ${bytesStreamed} bytes`);
+      });
+      response.Body.on('error', (err) => {
+        console.error(`   ✗ Stream error:`, err.message);
+      });
+    }
+
+    await pipeline(response.Body, res);
+  } catch (error) {
+    if (clientAborted() || isClientAbortError(error)) {
+      if (DEBUG) {
+        console.warn(`⚠ Stream aborted for ${configName}/${filePath}: ${error.message}`);
+      }
+      return;
+    }
+
+    console.error(`✗ ${configName}/${filePath}: ${error.message}`);
+
+    if (DEBUG) {
+      console.error(`   - Error type: ${error.constructor.name}`);
+      console.error(`   - Status: ${error.$metadata?.httpStatusCode || 'unknown'}`);
+    }
+
+    if (!res.headersSent) {
+      if (error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404) {
+        return res.status(404).json({
+          error: 'File not found',
+          path: filePath,
+          backend: configName,
+        });
+      }
+
+      return res.status(500).json({
+        error: 'Internal server error',
+        message: error.message,
+      });
+    }
+  } finally {
+    req.off('aborted', onRequestAborted);
+    res.off('close', onResponseClosed);
+  }
+}
+
+async function serveHttpObject(proxy, configName, filePath, req, res) {
+  const { config } = proxy;
+  const targetUrl = buildHttpUrl(config, filePath);
+
+  if (DEBUG) {
+    console.log(`🔍 ${configName}/${filePath} (http, range: ${req.headers.range || 'full'})`);
+    console.log(`   - Target URL: ${targetUrl}`);
+  }
+
+  let upstreamBody;
+  const abortController = new AbortController();
+  const { clientAborted, onRequestAborted, bindResponseCloseHandler } = createAbortHandlers(
+    configName,
+    filePath,
+    abortController,
+    () => upstreamBody
+  );
+  const onResponseClosed = bindResponseCloseHandler(res);
+
+  req.on('aborted', onRequestAborted);
+  res.on('close', onResponseClosed);
+
+  try {
+    const headers = {};
+    const authorization = buildHttpAuthHeader(config);
+    if (authorization) {
+      headers.Authorization = authorization;
+    }
+    if (req.headers.range) {
+      headers.Range = req.headers.range;
+    }
+
+    const response = await fetch(targetUrl, {
+      method: 'GET',
+      headers,
+      signal: abortController.signal,
+    });
+
+    if (!response.ok && response.status !== 206) {
+      if (response.status === 404) {
+        return res.status(404).json({
+          error: 'File not found',
+          path: filePath,
+          backend: configName,
+        });
+      }
+
+      return res.status(response.status).json({
+        error: 'Upstream request failed',
+        status: response.status,
+        path: filePath,
+        backend: configName,
+      });
+    }
+
+    res.status(response.status);
+
+    const passthroughHeaders = [
+      'content-type',
+      'content-length',
+      'content-range',
+      'accept-ranges',
+      'last-modified',
+      'etag',
+    ];
+
+    for (const headerName of passthroughHeaders) {
+      const value = response.headers.get(headerName);
+      if (value) {
+        res.setHeader(headerName, value);
+      }
+    }
+
+    if (!response.headers.has('accept-ranges')) {
+      res.setHeader('Accept-Ranges', 'bytes');
+    }
+
+    if (!response.headers.has('cache-control')) {
+      res.setHeader('Cache-Control', 'public, max-age=31536000');
+    }
+
+    if (!response.body) {
+      return res.end();
+    }
+
+    upstreamBody = Readable.fromWeb(response.body);
+
+    if (DEBUG) {
+      let bytesStreamed = 0;
+      upstreamBody.on('data', (chunk) => {
+        bytesStreamed += chunk.length;
+      });
+      upstreamBody.on('end', () => {
+        console.log(`   ✓ Streamed ${bytesStreamed} bytes`);
+      });
+      upstreamBody.on('error', (err) => {
+        console.error(`   ✗ Stream error:`, err.message);
+      });
+    }
+
+    await pipeline(upstreamBody, res);
+  } catch (error) {
+    if (clientAborted() || isClientAbortError(error)) {
+      if (DEBUG) {
+        console.warn(`⚠ Stream aborted for ${configName}/${filePath}: ${error.message}`);
+      }
+      return;
+    }
+
+    console.error(`✗ ${configName}/${filePath}: ${error.message}`);
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        error: 'Internal server error',
+        message: error.message,
+      });
+    }
+  } finally {
+    req.off('aborted', onRequestAborted);
+    res.off('close', onResponseClosed);
+  }
+}
+
 // Main API endpoint: /api/storage/:configName/*
 app.get('/api/storage/:configName/*', async (req, res, next) => {
   const { configName } = req.params;
@@ -324,124 +692,13 @@ app.get('/api/storage/:configName/*', async (req, res, next) => {
     });
   }
 
-  const { s3: s3Client, config } = proxyInstances[configName];
+  const proxy = proxyInstances[configName];
 
-  // Construct full S3 key with folder prefix
-  const s3Key = buildS3Key(config, filePath);
-
-  if (DEBUG) {
-    console.log(`🔍 ${configName}/${filePath} (range: ${req.headers.range || 'full'})`);
+  if (proxy.type === 'http') {
+    return serveHttpObject(proxy, configName, filePath, req, res);
   }
 
-  let response;
-  let clientAborted = false;
-  const abortController = new AbortController();
-  const abortUpstream = (reason) => {
-    if (clientAborted) {
-      return;
-    }
-
-    clientAborted = true;
-    console.warn(`⚠ Client aborted ${configName}/${filePath}: ${reason}`);
-
-    if (!abortController.signal.aborted) {
-      abortController.abort();
-    }
-
-    if (response?.Body && typeof response.Body.destroy === 'function') {
-      response.Body.destroy(new Error(reason));
-    }
-  };
-  const onRequestAborted = () => abortUpstream('request aborted');
-  const onResponseClosed = () => {
-    if (!res.writableEnded) {
-      abortUpstream('response closed before stream completed');
-    }
-  };
-
-  req.on('aborted', onRequestAborted);
-  res.on('close', onResponseClosed);
-
-  try {
-    // Get object from S3 (with range support)
-    const command = new GetObjectCommand({
-      Bucket: config.bucket,
-      Key: s3Key,
-      Range: req.headers.range,
-    });
-    
-    response = await s3Client.send(command, {
-      abortSignal: abortController.signal,
-    });
-    
-    // Set response headers
-    if (req.headers.range) {
-      res.status(206); // Partial Content
-      res.setHeader('Content-Range', response.ContentRange);
-    } else {
-      res.status(200);
-    }
-    
-    res.setHeader('Content-Type', response.ContentType || 'application/octet-stream');
-    res.setHeader('Content-Length', response.ContentLength);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'public, max-age=31536000');
-    res.setHeader('Last-Modified', response.LastModified?.toUTCString() || new Date().toUTCString());
-    
-    if (response.ETag) {
-      res.setHeader('ETag', response.ETag);
-    }
-    
-    // Stream the body to response
-    if (DEBUG) {
-      let bytesStreamed = 0;
-      response.Body.on('data', (chunk) => {
-        bytesStreamed += chunk.length;
-      });
-      response.Body.on('end', () => {
-        console.log(`   ✓ Streamed ${bytesStreamed} bytes`);
-      });
-      response.Body.on('error', (err) => {
-        console.error(`   ✗ Stream error:`, err.message);
-      });
-    }
-    
-    await pipeline(response.Body, res);
-    
-  } catch (error) {
-    if (clientAborted || isClientAbortError(error)) {
-      if (DEBUG) {
-        console.warn(`⚠ Stream aborted for ${configName}/${filePath}: ${error.message}`);
-      }
-      return;
-    }
-
-    console.error(`✗ ${configName}/${filePath}: ${error.message}`);
-    
-    if (DEBUG) {
-      console.error(`   - Error type: ${error.constructor.name}`);
-      console.error(`   - Status: ${error.$metadata?.httpStatusCode || 'unknown'}`);
-    }
-    
-    // Only send error response if headers haven't been sent yet
-    if (!res.headersSent) {
-      if (error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404) {
-        return res.status(404).json({
-          error: 'File not found',
-          path: filePath,
-          backend: configName
-        });
-      }
-      
-      return res.status(500).json({
-        error: 'Internal server error',
-        message: error.message
-      });
-    }
-  } finally {
-    req.off('aborted', onRequestAborted);
-    res.off('close', onResponseClosed);
-  }
+  return serveS3Object(proxy, configName, filePath, req, res);
 });
 
 // 404 handler
@@ -480,8 +737,10 @@ function shutdown(signal) {
   console.log(`✓ Received ${signal}, shutting down gracefully`);
 
   server.close(() => {
-    for (const { s3: s3Client } of Object.values(proxyInstances)) {
-      s3Client.destroy();
+    for (const proxy of Object.values(proxyInstances)) {
+      if (proxy.type === 's3') {
+        proxy.s3.destroy();
+      }
     }
 
     console.log('✓ Shutdown complete');

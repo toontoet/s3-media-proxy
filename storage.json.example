@@ -18,6 +18,12 @@
     "bucket": "your-vod-bucket",
     "folder": "ondemand",
     "healthCheckKey": "healthcheck.txt"
+  },
+  "SYNOLOGY": {
+    "url": "http://192.168.1.100:5005/media/",
+    "username": "your-username",
+    "password": "your-password",
+    "healthCheckPath": "healthcheck.txt"
   }
 }
 
