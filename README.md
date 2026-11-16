@@ -28,7 +28,7 @@ Create a `storage.json` file with your S3 backend configurations:
     "accessKey": "YOUR_ACCESS_KEY",
     "accessSecret": "YOUR_SECRET_KEY",
     "region": "eu-central",
-    "endpoint": "fsn1.your-objectstorage.com",
+    "endpoint": "https://fsn1.your-objectstorage.com",
     "bucket": "your-bucket-name",
     "folder": "media",
     "healthCheckKey": "healthcheck.txt"
@@ -38,7 +38,7 @@ Create a `storage.json` file with your S3 backend configurations:
     "accessKey": "YOUR_ACCESS_KEY",
     "accessSecret": "YOUR_SECRET_KEY",
     "region": "eu-central",
-    "endpoint": "fsn1.your-objectstorage.com",
+    "endpoint": "https://fsn1.your-objectstorage.com",
     "bucket": "your-vod-bucket",
     "folder": "ondemand",
     "healthCheckKey": "healthcheck.txt"
@@ -52,7 +52,7 @@ Create a `storage.json` file with your S3 backend configurations:
 - `accessKey`: S3 access key
 - `accessSecret`: S3 secret key
 - `region`: AWS region
-- `endpoint`: S3-compatible endpoint (without https://)
+- `endpoint`: S3-compatible endpoint URL (with `https://` or `http://`; host-only values still work)
 - `bucket`: Bucket name
 - `folder`: Folder prefix within the bucket (optional)
 - `healthCheckKey`: Object key used by `/ready` to verify object access (optional, relative to `folder`)

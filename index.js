@@ -32,6 +32,18 @@ function buildS3Key(config, filePath) {
   return config.folder ? `${config.folder}/${filePath}` : filePath;
 }
 
+function normalizeS3Endpoint(endpoint) {
+  if (!endpoint) {
+    return undefined;
+  }
+
+  if (/^https?:\/\//i.test(endpoint)) {
+    return endpoint;
+  }
+
+  return `https://${endpoint}`;
+}
+
 function getBackendType(config) {
   if (config.type === 's3') {
     return 's3';
@@ -125,7 +137,7 @@ async function initializeProxies() {
 
         const s3Client = new S3Client({
           region: config.region,
-          endpoint: config.endpoint ? `https://${config.endpoint}` : undefined,
+          endpoint: normalizeS3Endpoint(config.endpoint),
           credentials: {
             accessKeyId: config.accessKey,
             secretAccessKey: config.accessSecret,

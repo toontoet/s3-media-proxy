@@ -4,7 +4,7 @@
     "accessKey": "YOUR_ACCESS_KEY",
     "accessSecret": "YOUR_SECRET_KEY",
     "region": "eu-central",
-    "endpoint": "fsn1.your-objectstorage.com",
+    "endpoint": "https://fsn1.your-objectstorage.com",
     "bucket": "your-bucket-name",
     "folder": "media",
     "healthCheckKey": "healthcheck.txt"
@@ -14,7 +14,7 @@
     "accessKey": "YOUR_ACCESS_KEY",
     "accessSecret": "YOUR_SECRET_KEY",
     "region": "eu-central",
-    "endpoint": "fsn1.your-objectstorage.com",
+    "endpoint": "https://fsn1.your-objectstorage.com",
     "bucket": "your-vod-bucket",
     "folder": "ondemand",
     "healthCheckKey": "healthcheck.txt"
